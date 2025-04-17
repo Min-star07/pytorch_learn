@@ -7,110 +7,109 @@ def tensor2image(tensor):
     """
     Convert a tensor to a numpy image.
     Args:
-        tensor (torch.Tensor): The input tensor.
+        tensor (torch.Tensor): The input tensor of shape (C, H, W) or (B, C, H, W).
     Returns:
-        np.ndarray: The converted image.
+        np.ndarray: The converted image in HWC format with uint8 dtype.
     """
-    image = 127.5 * (tensor[0].cpu().float().numpy() + 1.0)
+    if len(tensor.shape) == 4:  # If batch dimension exists
+        tensor = tensor[0]  # Take first image in batch
 
-    if image.shape[0] == 1:
+    image = 127.5 * (tensor.cpu().float().numpy() + 1.0)
+
+    if image.shape[0] == 1:  # Grayscale to RGB
         image = np.tile(image, (3, 1, 1))
-    return image.astype(np.uint8).transpose(1, 2, 0)
+
+    return image.clip(0, 255).astype(np.uint8).transpose(1, 2, 0)
 
 
-class ReplayBuffer(object):
+class ReplayBuffer:
     """
-    Create a replay buffer with a specified size.
+    Replay buffer to store and sample generated images.
     Args:
-        buffer_size (int): The size of the buffer.
-    Returns:
-        list: The replay buffer.
+        max_size (int): Maximum number of images to store in the buffer.
     """
 
     def __init__(self, max_size=50):
         assert max_size > 0, "ReplayBuffer size must be positive"
-
         self.max_size = max_size
         self.data = []
 
     def push_and_pop(self, data):
         """
-        Push data into the buffer and pop a random sample from it.
+        Push new data into buffer and return a sample.
         Args:
-            data (torch.Tensor): The input data.
+            data (torch.Tensor): New data to add to buffer.
         Returns:
-            torch.Tensor: A random sample from the buffer.
+            torch.Tensor: Either new data or a sample from buffer.
         """
-        to_return = []
-        for elemments in data.data:
+        # Handle case where buffer is empty
+        if len(self.data) == 0:
+            self.data.append(data.detach().clone())
+            return data
+
+        # Decide whether to return new data or buffer sample
+        if random.uniform(0, 1) > 0.5 and len(self.data) > 0:
+            random_id = random.randint(0, len(self.data) - 1)
+            to_return = self.data[random_id].clone()
+            # Replace with new data
             if len(self.data) < self.max_size:
-                self.data.append(elemments)
-                to_return.append(elemments)
+                self.data.append(data.detach().clone())
             else:
-                if random.uniform(0, 1) > 0.5:
-                    random_id = random.randint(0, self.max_size - 1)
-                    to_return.append(self.data[random_id])
-                    self.data[random_id] = elemments
-                else:
-                    to_return.append(elemments)
+                self.data[random_id] = data.detach().clone()
+            return to_return
+        else:
+            if len(self.data) < self.max_size:
+                self.data.append(data.detach().clone())
+            return data
 
 
-class LambdaLR(object):
+class LambdaLR:
     """
-    Lambda learning rate scheduler.
+    Learning rate scheduler that linearly decays the learning rate after a certain epoch.
     Args:
-        optimizer (torch.optim.Optimizer): The optimizer to be scheduled.
-        lr_lambda (function): A function that computes the learning rate.
-        last_epoch (int): The index of the last epoch.
+        n_epochs (int): Total number of training epochs.
+        offset (int): Starting epoch offset.
+        decay_start_epoch (int): Epoch at which to start decaying the learning rate.
     """
 
     def __init__(self, n_epochs, offset, decay_start_epoch):
         assert (
             n_epochs - decay_start_epoch
-        ) > 0, "Decay start epoch must be less than total epochs"
+        ) > 0, "Decay must start before end of training"
         self.n_epochs = n_epochs
         self.offset = offset
         self.decay_start_epoch = decay_start_epoch
 
     def step(self, epoch):
         """
-        Step the learning rate scheduler.
+        Compute the learning rate multiplier for the given epoch.
         Args:
-            epoch (int): The current epoch.
+            epoch (int): Current epoch number.
+        Returns:
+            float: Learning rate multiplier.
         """
+        epoch = epoch + self.offset  # Apply offset
         if epoch < self.decay_start_epoch:
-            lr = 1.0
-        else:
-            lr = 1.0 - max(0, epoch + self.offset - self.decay_start_epoch) / float(
-                self.n_epochs - self.decay_start_epoch
-            )
-        return lr
+            return 1.0
+        return max(
+            0.0,
+            1.0
+            - (epoch - self.decay_start_epoch)
+            / (self.n_epochs - self.decay_start_epoch),
+        )
 
 
 def weights_init_normal(m):
     """
-    Initialize weights of a model using normal distribution.
+    Initialize weights of convolutional and linear layers with normal distribution.
     Args:
-        m (torch.nn.Module): The model to be initialized.
+        m (nn.Module): PyTorch module to initialize.
     """
     classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        torch.nn.init.normal(m.weight.data, 0.0, 0.02)
-    elif classname.find("BatchNorm2d") != -1:
-        torch.nn.init.normal(m.weight.data, 1.0, 0.02)
-        torch.nn.init.constant(m.bias.data, 0.0)
-    elif classname.find("Linear") != -1:
-        torch.nn.init.normal(m.weight.data, 0.0, 0.02)
-        torch.nn.init.constant(m.bias.data, 0.0)
-    elif classname.find("InstanceNorm2d") != -1:
-        torch.nn.init.normal(m.weight.data, 1.0, 0.02)
-        torch.nn.init.constant(m.bias.data, 0.0)
-    elif classname.find("ReLU") != -1:
-        torch.nn.init.constant(m.weight.data, 0.0)
-        torch.nn.init.constant(m.bias.data, 0.0)
-    elif classname.find("LeakyReLU") != -1:
-        torch.nn.init.constant(m.weight.data, 0.0)
-        torch.nn.init.constant(m.bias.data, 0.0)
-    elif classname.find("Tanh") != -1:
-        torch.nn.init.constant(m.weight.data, 0.0)
-        torch.nn.init.constant(m.bias.data, 0.0)
+    if classname.find("Conv") != -1 or classname.find("Linear") != -1:
+        torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
+        if hasattr(m, "bias") and m.bias is not None:
+            torch.nn.init.constant_(m.bias.data, 0.0)
+    elif classname.find("BatchNorm2d") != -1 or classname.find("InstanceNorm2d") != -1:
+        torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
+        torch.nn.init.constant_(m.bias.data, 0.0)
